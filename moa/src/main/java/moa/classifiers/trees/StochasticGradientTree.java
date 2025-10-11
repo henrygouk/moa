@@ -9,9 +9,14 @@ import com.github.javacliparser.IntOption;
 import com.github.javacliparser.MultiChoiceOption;
 import com.github.javacliparser.FlagOption;
 import com.yahoo.labs.samoa.instances.Instance;
+import com.yahoo.labs.samoa.instances.MultiLabelInstance;
+import com.yahoo.labs.samoa.instances.MultiLabelPrediction;
+import com.yahoo.labs.samoa.instances.Prediction;
 
 import moa.classifiers.AbstractClassifier;
 import moa.classifiers.MultiClassClassifier;
+import moa.classifiers.MultiLabelClassifier;
+import moa.classifiers.MultiTargetRegressor;
 import moa.classifiers.Regressor;
 import moa.core.Measurement;
 import moa.core.ObjectRepository;
@@ -21,7 +26,7 @@ import moa.options.AbstractOptionHandler;
 import moa.options.ClassOption;
 import moa.tasks.TaskMonitor;
 
-public class StochasticGradientTree extends AbstractClassifier implements MultiClassClassifier, Regressor {
+public class StochasticGradientTree extends AbstractClassifier implements MultiClassClassifier, Regressor, MultiLabelClassifier, MultiTargetRegressor {
     private static final long serialVersionUID = 1L;
 
     protected Node root;
@@ -70,12 +75,32 @@ public class StochasticGradientTree extends AbstractClassifier implements MultiC
     }
 
     @Override
+    public void trainOnInstanceImpl(MultiLabelInstance inst) {
+        trainOnInstanceImpl((Instance) inst);
+    }
+
+    @Override
     public void trainOnInstanceImpl(Instance inst) {
         if (root == null) {
-            if (inst.classAttribute().isNominal()) {
-                root = new Node(new double[inst.classAttribute().numValues()]);
+            if (inst instanceof MultiLabelInstance) {
+                int numLabels = ((MultiLabelInstance) inst).numOutputAttributes();
+                int numValues = 0;
+
+                for (int i = 0; i < numLabels; i++) {
+                    if (inst.outputAttribute(i).isNominal()) {
+                        numValues += inst.outputAttribute(i).numValues();
+                    } else {
+                        numValues += 1;
+                    }
+                }
+
+                root = new Node(new double[numValues]);
             } else {
-                root = new Node(new double[1]);
+                if (inst.classAttribute().isNominal()) {
+                    root = new Node(new double[inst.classAttribute().numValues()]);
+                } else {
+                    root = new Node(new double[1]);
+                }
             }
         }
 
@@ -119,26 +144,89 @@ public class StochasticGradientTree extends AbstractClassifier implements MultiC
         }
     }
 
-
     @Override
     public double[] getVotesForInstance(Instance inst) {
-        if (inst.classAttribute().isNominal()) {
-            if (root == null) {
-                return new double[inst.classAttribute().numValues()];
-            } else {
-                Node leaf = root.findLeaf(inst);
-                double[] values = leaf.getPredictions(inst);
-                softmax(values);
-                return values;
+        if (root == null) {
+            return new double[7];
+        }
+
+        double[] votes = root.findLeaf(inst).getPredictions(inst);
+
+        if (inst instanceof MultiLabelInstance) {
+            int ctr = 0;
+            MultiLabelInstance mlInst = (MultiLabelInstance) inst;
+
+            for (int i = 0; i < mlInst.numOutputAttributes(); i++) {
+                if (mlInst.outputAttribute(i).isNominal()) {
+                    int numValues = mlInst.outputAttribute(i).numValues();
+                    double[] dist = new double[numValues];
+                    System.arraycopy(votes, ctr, dist, 0, numValues);
+                    softmax(dist);
+                    System.arraycopy(dist, 0, votes, ctr, numValues);
+                    ctr += numValues;
+                } else {
+                    ctr += 1;
+                }
             }
         } else {
-            if (root == null) {
-                return new double[] { 0.0 };
-            } else {
-                Node leaf = root.findLeaf(inst);
-                return leaf.getPredictions(inst);
+            if (inst.classAttribute().isNominal()) {
+                softmax(votes);
             }
         }
+
+        return votes;
+
+        // if (inst.classAttribute().isNominal()) {
+        //     if (root == null) {
+        //         return new double[inst.classAttribute().numValues()];
+        //     } else {
+        //         Node leaf = root.findLeaf(inst);
+        //         double[] values = leaf.getPredictions(inst);
+        //         softmax(values);
+        //         return values;
+        //     }
+        // } else {
+        //     if (root == null) {
+        //         return new double[] { 0.0 };
+        //     } else {
+        //         Node leaf = root.findLeaf(inst);
+        //         return leaf.getPredictions(inst);
+        //     }
+        // }
+    }
+
+    @Override
+    public Prediction getPredictionForInstance(MultiLabelInstance inst) {
+        return getPredictionForInstance(inst);
+    }
+
+    @Override
+    public Prediction getPredictionForInstance(Instance inst) {
+        double[] votes = getVotesForInstance(inst);
+
+        if (!(inst instanceof MultiLabelInstance)) {
+            Prediction pred = new MultiLabelPrediction(1);
+            pred.setVotes(votes);
+            return pred;
+        }
+
+        Prediction prediction = new MultiLabelPrediction(inst.numOutputAttributes());
+
+        int ctr = 0;
+
+        for (int i = 0; i < inst.numOutputAttributes(); i++) {
+            if (inst.outputAttribute(i).isNominal()) {
+                double[] dist = new double[inst.outputAttribute(i).numValues()];
+                System.arraycopy(votes, ctr, dist, 0, dist.length);
+                prediction.setVotes(i, dist);
+                ctr += dist.length;
+            } else {
+                prediction.setVotes(i, new double[] { votes[ctr] });
+                ctr += 1;
+            }
+        }
+
+        return prediction;
     }
 
     @Override
@@ -192,31 +280,74 @@ public class StochasticGradientTree extends AbstractClassifier implements MultiC
     }
 
     protected Gradients computeGradients(Instance inst, double[] predictions) {
-        // Figure out what type of learning problem we've got going on here
-        if (inst.classAttribute().isNominal()) {
-            Gradients grads = new Gradients(inst.classAttribute().numValues());
+        if (inst instanceof MultiLabelInstance) {
+            MultiLabelInstance mlInst = (MultiLabelInstance) inst;
+            int numLabels = mlInst.numberOutputTargets();
+            double[][] gradients = new double[numLabels][];
+            double[][] hessians = new double[numLabels][];
+            int ctr = 0;
 
-            predictions = predictions.clone();
-            softmax(predictions);
-            
-            int label = (int) inst.classValue();
+            for (int i = 0; i < numLabels; i++) {
+                if (mlInst.outputAttribute(i).isNominal()) {
+                    int label = (int) mlInst.classValue(i);
+                    gradients[i] = new double[mlInst.outputAttribute(i).numValues()];
+                    hessians[i] = new double[mlInst.outputAttribute(i).numValues()];
+                    double[] preds = new double[mlInst.outputAttribute(i).numValues()];
+                    System.arraycopy(predictions, ctr, preds, 0, preds.length);
+                    computeSoftmaxGradients(preds, label, gradients[i], hessians[i]);
+                    ctr += preds.length;
+                } else {
+                    double label = mlInst.classValue(i);
+                    gradients[i] = new double[1];
+                    hessians[i] = new double[1];
+                    computeSquaredErrorGradients(predictions[i], label, gradients[i], hessians[i]);
+                    ctr += 1;
+                }
+            }
 
-            for (int i = 0; i < predictions.length; i++) {
-                double prob = predictions[i];
-                double indicator = (i == label) ? 1.0 : 0.0;
-                grads.gradients[i] = prob - indicator;
-                grads.hessians[i] = prob * (1.0 - prob);
+            Gradients grads = new Gradients(predictions.length);
+            ctr = 0;
+
+            // Flatten gradients and hessians
+            for (int i = 0; i < numLabels; i++) {
+                for (int j = 0; j < gradients[i].length; j++) {
+                    grads.gradients[ctr] = gradients[i][j];
+                    grads.hessians[ctr] = hessians[i][j];
+                    ctr++;
+                }
             }
 
             return grads;
         } else {
-            // Regression case: single gradient and hessian of squared loss
-            Gradients grads = new Gradients(1);
-            grads.gradients[0] = predictions[0] - inst.classValue();
-            grads.hessians[0] = 1.0;
-
-            return grads;
+            if (inst.classAttribute().isNominal()) {
+                int label = (int) inst.classValue();
+                Gradients grads = new Gradients(predictions.length);
+                computeSoftmaxGradients(predictions, label, grads.gradients, grads.hessians);
+                return grads;
+            } else {
+                double label = inst.classValue();
+                Gradients grads = new Gradients(1);
+                computeSquaredErrorGradients(predictions[0], label, grads.gradients, grads.hessians);
+                return grads;
+            }
         }
+    }
+
+    protected void computeSoftmaxGradients(double[] predictions, int label, double[] grads, double[] hess) {
+        predictions = predictions.clone();
+        softmax(predictions);
+
+        for (int i = 0; i < predictions.length; i++) {
+            double prob = predictions[i];
+            double indicator = (i == label) ? 1.0 : 0.0;
+            grads[i] = prob - indicator;
+            hess[i] = prob * (1.0 - prob);
+        }
+    }
+
+    protected void computeSquaredErrorGradients(double prediction, double label, double[] grads, double[] hess) {
+        grads[0] = prediction - label;
+        hess[0] = 1.0;
     }
 
     public abstract static class Discretizer extends AbstractOptionHandler {
