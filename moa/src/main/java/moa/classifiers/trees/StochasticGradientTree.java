@@ -1,10 +1,13 @@
 package moa.classifiers.trees;
 
 import java.io.Serializable;
+import java.util.List;
+import java.util.LinkedList;
 
 import com.github.javacliparser.FloatOption;
 import com.github.javacliparser.IntOption;
 import com.github.javacliparser.MultiChoiceOption;
+import com.github.javacliparser.FlagOption;
 import com.yahoo.labs.samoa.instances.Instance;
 
 import moa.classifiers.AbstractClassifier;
@@ -13,6 +16,7 @@ import moa.classifiers.Regressor;
 import moa.core.Measurement;
 import moa.core.ObjectRepository;
 import moa.core.Statistics;
+import moa.core.StringUtils;
 import moa.options.AbstractOptionHandler;
 import moa.options.ClassOption;
 import moa.tasks.TaskMonitor;
@@ -22,38 +26,47 @@ public class StochasticGradientTree extends AbstractClassifier implements MultiC
 
     protected Node root;
     protected Discretizer[] discretizers;
+    protected int numObservations;
 
-    public ClassOption discretizerOption = new ClassOption("discretizer", 'd',
+    public ClassOption discretizerOption = new ClassOption("discretizer", 'D',
             "Discretizer to use for numeric attributes.", Discretizer.class, EqualWidthDiscretizer.class.getName() + " -bins 64");
 
-    public IntOption gracePeriodOption = new IntOption("gracePeriod", 'g',
+    public IntOption gracePeriodOption = new IntOption("gracePeriod", 'G',
             "The number of instances a leaf should observe between split attempts.", 200, 1, Integer.MAX_VALUE);
 
-    public FloatOption lambdaOption = new FloatOption("lambda", 'l',
-            "Regularization parameter lambda; should be interpreted as the inverse of a learning rate.", 0.1, 0.0, Float.MAX_VALUE);
+    public FloatOption lambdaOption = new FloatOption("lambda", 'L',
+            "Regularization parameter lambda.", 0.1, 0.0, Float.MAX_VALUE);
 
-    public FloatOption confidenceOption = new FloatOption("confidence", 'c',
-            "The allowable error in split decision, a value closer to 0 takes longer to decide.", 1E-7, 0.0, 1.0);
+    public IntOption warmStartOption = new IntOption("warmStart", 'W',
+            "Number of instances to use for fitting the discritizers", 1000, 0, Integer.MAX_VALUE);
 
-    public FloatOption minImprovementOption = new FloatOption("minImprovement", 'm',
-            "The minimum loss reduction required to allow a split to occur.", 1e-3, 0.0, Float.MAX_VALUE);
+    public FloatOption confidenceOption = new FloatOption("confidence", 'C',
+            "The level of confidence required that a split candidate is an improvement before before the split is actually performed.", 1E-6, 0.0, 1.0);
 
-    public MultiChoiceOption splitTestOption = new MultiChoiceOption("splitTest", 's',
+    public MultiChoiceOption splitTestOption = new MultiChoiceOption("splitTest", 'T',
             "Which type of hypothesis test to use for determining when to split.",
-            new String[] { "First"},
-            new String[] { "Choose the first split with a significant improvement." },
+            new String[] { "TTest" },
+            new String[] { "Use a t-Test for checking statistical significance." },
             0);
+
+    public FlagOption disableResplitsOption = new FlagOption("disableResplits", 'R',
+            "Disable node resplitting.");
 
     @Override
     protected Measurement[] getModelMeasurementsImpl() {
-        // TODO Auto-generated method stub
-        return new Measurement[0];
+        List<Measurement> ret = new LinkedList<Measurement>();
+
+        ret.add(new Measurement("leaf nodes", root == null ? 0 : root.getNumLeafNodes()));
+        ret.add(new Measurement("nodes", root == null ? 0 : root.getNumNodes()));
+
+        return ret.toArray(new Measurement[ret.size()]);
     }
 
     @Override
     public void resetLearningImpl() {
         root = null;
         discretizers = null;
+        numObservations = 0;
     }
 
     @Override
@@ -66,25 +79,39 @@ public class StochasticGradientTree extends AbstractClassifier implements MultiC
             }
         }
 
-        observeDiscretizers(inst);
+        numObservations++;
 
-        // Find the leaf node for the instance
-        Node leaf = root.findLeaf(inst);
+        if (numObservations <= warmStartOption.getValue()) {
+            observeDiscretizers(inst);
+            return;
+        }
 
-        Gradients grads = computeGradients(inst, leaf.getValues());
+        if (!disableResplitsOption.isSet()) {
+            Node current = root;
 
-        // Update the leaf node with the instance
-        leaf.updateStats(inst, grads);
+            while (current != null) {
+                trainNode(inst, current);
+                current = current.getChild(inst);
+            }
+        } else {
+            Node leaf = root.findLeaf(inst);
+            trainNode(inst, leaf);
+        }
+    }
 
-        // Check if the leaf node should be split
-        if (leaf.getCount() % gracePeriodOption.getValue() == 0) {
-            Split split = leaf.findBestSplit();
+    protected void trainNode(Instance inst, Node node) {
+        node.updateStats(inst, computeGradients(inst, node.getPredictions(inst)));
+
+        if (node.getCount() % gracePeriodOption.getValue() == 0) {
+            Split split = node.findBestSplit();
 
             if (splitTestOption.getChosenIndex() == 0) {
-                double pValue = computeTTestPValue(split, leaf.getCount());
+                double c = Statistics.normalInverse(1.0 - confidenceOption.getValue());
+                double bestUpper = split.deltaLoss + c * Math.sqrt(split.deltaLossVar / node.getCount());
+                double baselineLower = split.baselineLoss - c * Math.sqrt(split.baselineVar / node.getCount());
 
-                if (pValue < confidenceOption.getValue() && split.deltaLoss < -minImprovementOption.getValue()) {
-                    leaf.applySplit(split);
+                if (bestUpper < baselineLower) {
+                    node.applySplit(split);
                 }
             } else {
                 throw new IllegalStateException("Unknown split test option: " + splitTestOption.getChosenIndex());
@@ -92,19 +119,6 @@ public class StochasticGradientTree extends AbstractClassifier implements MultiC
         }
     }
 
-    protected double computeTTestPValue(Split split, int instances) {
-        // H0: the expected loss is zero
-        // HA: the expected loss is not zero
-
-        try {
-            double F = instances * Math.pow(split.deltaLoss, 2.0) / split.deltaLossVar;
-
-            return Statistics.FProbability(F, 1, instances - 1);
-        }
-        catch(ArithmeticException e) {
-            return 1.0;
-        }
-    }
 
     @Override
     public double[] getVotesForInstance(Instance inst) {
@@ -113,7 +127,7 @@ public class StochasticGradientTree extends AbstractClassifier implements MultiC
                 return new double[inst.classAttribute().numValues()];
             } else {
                 Node leaf = root.findLeaf(inst);
-                double[] values = leaf.getValues();
+                double[] values = leaf.getPredictions(inst);
                 softmax(values);
                 return values;
             }
@@ -122,7 +136,7 @@ public class StochasticGradientTree extends AbstractClassifier implements MultiC
                 return new double[] { 0.0 };
             } else {
                 Node leaf = root.findLeaf(inst);
-                return leaf.getValues();
+                return leaf.getPredictions(inst);
             }
         }
     }
@@ -134,7 +148,9 @@ public class StochasticGradientTree extends AbstractClassifier implements MultiC
 
     @Override
     public void getModelDescription(StringBuilder out, int indent) {
-        // TODO Auto-generated method stub
+        if (root != null) {
+            root.describeSubtree(out, indent);
+        }
     }
 
     protected void observeDiscretizers(Instance inst) {
@@ -454,6 +470,8 @@ public class StochasticGradientTree extends AbstractClassifier implements MultiC
         public double deltaLoss;
         public double deltaLossVar;
         public double[][] deltaValues;
+        public double baselineLoss;
+        public double baselineVar;
     }
 
     protected class Node implements Serializable {
@@ -467,34 +485,92 @@ public class StochasticGradientTree extends AbstractClassifier implements MultiC
         private GradientStats[][] attributeStats;
 
         public Node(double[] values) {
-            this.values = values;
+            this.values = values.clone();
             this.children = null;
             this.totalStats = null;
             this.attributeStats = null;
+            this.splitAttributeIndex = -1;
+            this.splitThreshold = -1;
+        }
+
+        public int getNumLeafNodes() {
+            if (this.children == null) {
+                return 1;
+            } else {
+                int l = 0;
+
+                for (Node n : children) {
+                    l += n.getNumLeafNodes();
+                }
+
+                return l;
+            }
+        }
+
+        public int getNumNodes() {
+            int l = 1;
+
+            if (children != null) {
+                for (Node n : children) {
+                    l += n.getNumNodes();
+                }
+            }
+
+            return l;
+        }
+
+        public void describeSubtree(StringBuilder out, int indent) {
+            if (this.children == null) {
+                StringUtils.appendIndented(out, indent, values.toString());
+                StringUtils.appendNewline(out);
+            } else {
+                if (splitThreshold != -1) {
+                    for (int i = 0; i < children.length; i++) {
+                        StringUtils.appendIndented(out, indent, "if att_" + splitAttributeIndex + " == " + i + ":\n");
+                        children[i].describeSubtree(out, indent + 2);
+                    }
+                } else {
+                    StringUtils.appendIndented(out, indent, "if att_" + splitAttributeIndex + " <= " + splitThreshold + ":\n");
+                    children[0].describeSubtree(out, indent + 2);
+                    StringUtils.appendIndented(out, indent, "else:\n");
+                    children[1].describeSubtree(out, indent + 2);
+                }
+            }
+        }
+
+        public Node getChild(Instance inst) {
+            if (children == null) {
+                return null;
+            } else {
+                if (inst.attribute(splitAttributeIndex).isNominal()) {
+                    int attrValue = (int) inst.value(splitAttributeIndex);
+                    return children[attrValue];
+                } else {
+                    int attrValue = discretizers[splitAttributeIndex].getBin(inst.value(splitAttributeIndex));
+
+                    if (attrValue <= splitThreshold) {
+                        return children[0];
+                    } else {
+                        return children[1];
+                    }
+                }
+            }
         }
 
         public Node findLeaf(Instance inst) {
             if (children == null) {
                 return this;
             } else {
-                if (inst.attribute(splitAttributeIndex).isNominal()) {
-                    int attrValue = (int) inst.value(splitAttributeIndex);
-                    return children[attrValue].findLeaf(inst);
-                } else {
-                    int attrValue = discretizers[splitAttributeIndex].getBin(inst.value(splitAttributeIndex));
-
-                    if (attrValue <= splitThreshold) {
-                        return children[0].findLeaf(inst);
-                    } else {
-                        return children[1].findLeaf(inst);
-                    }
-                }
+                return getChild(inst).findLeaf(inst);
             }
         }
 
         public void updateStats(Instance inst, Gradients grads) {
             if (totalStats == null) {
                 totalStats = new GradientStats(values.length);
+            }
+
+            if (attributeStats == null) {
                 attributeStats = new GradientStats[inst.numAttributes()][];
 
                 for (int i = 0; i < inst.numAttributes(); i++) {
@@ -601,12 +677,60 @@ public class StochasticGradientTree extends AbstractClassifier implements MultiC
             return lossVar;
         }
 
+        public Split computeNominalSplit(int attributeIndex) {
+            Split split = new Split();
+            split.attributeIndex = attributeIndex;
+            split.isNominal = true;
+            split.deltaValues = new double[attributeStats[attributeIndex].length][values.length];
+            split.deltaLoss = 0.0;
+            int obs = 0;
+
+            for (int j = 0; j < attributeStats[attributeIndex].length; j++) {
+                split.deltaValues[j] = computeDeltaPreds(attributeStats[attributeIndex][j]);
+                double leafMean = computeLossMean(attributeStats[attributeIndex][j], split.deltaValues[j]);
+                double leafVar = computeLossVar(attributeStats[attributeIndex][j], split.deltaValues[j]);
+                int leafObs = attributeStats[attributeIndex][j].getCount();
+                split.deltaLoss = combineMean(split.deltaLoss, obs, leafMean, leafObs);
+                split.deltaLossVar = combineVariance(split.deltaLoss, split.deltaLossVar, obs, leafMean, leafVar, leafObs);
+                obs += leafObs;
+            }
+
+            return split;
+        }
+
+        public Split computeNumericSplit(int attributeIndex, int threshold, GradientStats leftStats, GradientStats rightStats) {
+            Split candidate = new Split();
+            candidate.attributeIndex = attributeIndex;
+            candidate.isNominal = false;
+            candidate.deltaValues = new double[2][];
+
+            double[] leftDeltaValues = computeDeltaPreds(leftStats);
+            double leftMean = computeLossMean(leftStats, leftDeltaValues);
+            double leftVar = computeLossVar(leftStats, leftDeltaValues);
+            int leftObs = leftStats.getCount();
+            
+            double[] rightDeltaValues = computeDeltaPreds(rightStats);
+            double rightMean = computeLossMean(rightStats, rightDeltaValues);
+            double rightVar = computeLossVar(rightStats, rightDeltaValues);
+            int rightObs = rightStats.getCount();
+            
+            double splitMean = combineMean(leftMean, leftObs, rightMean, rightObs);
+            double splitVar = combineVariance(leftMean, leftVar, leftObs, rightMean, rightVar, rightObs);
+
+            candidate.deltaLoss = splitMean;
+            candidate.deltaLossVar = splitVar;
+            candidate.threshold = threshold;
+            candidate.deltaValues[0] = leftDeltaValues;
+            candidate.deltaValues[1] = rightDeltaValues;
+
+            return candidate;
+        }
+
         public Split findBestSplit() {
             Split best = new Split();
-            best.attributeIndex = -1;
-            best.deltaValues = new double[][] { computeDeltaPreds(totalStats) };
-            best.deltaLoss = computeLossMean(totalStats, best.deltaValues[0]);
-            best.deltaLossVar = computeLossVar(totalStats, best.deltaValues[0]);
+            best.deltaLoss = Double.POSITIVE_INFINITY;
+            double baselineLoss = 0.0;
+            double baselineVar = 0.0;
             
             for (int i = 0; i < attributeStats.length; i++) {
                 if (attributeStats[i] == null) {
@@ -614,28 +738,18 @@ public class StochasticGradientTree extends AbstractClassifier implements MultiC
                     continue;
                 }
 
-                Split candidate = new Split();
-                candidate.attributeIndex = i;
-
                 if (discretizers[i] == null) {
-                    candidate.isNominal = true;
-                    candidate.deltaValues = new double[attributeStats[i].length][values.length];
-                    int obs = 0;
+                    Split candidate = computeNominalSplit(i);
 
-                    for (int j = 0; j < attributeStats[i].length; j++) {
-                        candidate.deltaValues[j] = computeDeltaPreds(attributeStats[i][j]);
-                        double leafMean = computeLossMean(attributeStats[i][j], candidate.deltaValues[j]);
-                        double leafVar = computeLossVar(attributeStats[i][j], candidate.deltaValues[j]);
-                        int leafObs = attributeStats[i][j].getCount();
+                    if (candidate.deltaLoss < best.deltaLoss) {
+                        best = candidate;
+                    }
 
-                        candidate.deltaLoss = combineMean(candidate.deltaLoss, obs, leafMean, leafObs);
-                        candidate.deltaLossVar = combineVariance(candidate.deltaLoss, candidate.deltaLossVar, obs, leafMean, leafVar, leafObs);
-                        obs += leafObs;
+                    if (this.splitAttributeIndex == i) {
+                        baselineLoss = candidate.deltaLoss;
+                        baselineVar = candidate.deltaLossVar;
                     }
                 } else {
-                    candidate.isNominal = false;
-                    candidate.deltaValues = new double[2][];
-
                     GradientStats[] forwardCumulative = new GradientStats[attributeStats[i].length - 1];
                     GradientStats[] backwardCumulative = new GradientStats[attributeStats[i].length - 1];
 
@@ -657,49 +771,31 @@ public class StochasticGradientTree extends AbstractClassifier implements MultiC
                         }
                     }
 
-                    candidate.deltaLoss = Double.POSITIVE_INFINITY;
-
                     for (int j = 0; j < forwardCumulative.length; j++) {
-                        double[] leftDeltaValues = computeDeltaPreds(forwardCumulative[j]);
-                        double leftMean = computeLossMean(forwardCumulative[j], leftDeltaValues);
-                        double leftVar = computeLossVar(forwardCumulative[j], leftDeltaValues);
-                        int leftObs = forwardCumulative[j].getCount();
-                        
-                        double[] rightDeltaValues = computeDeltaPreds(backwardCumulative[j]);
-                        double rightMean = computeLossMean(backwardCumulative[j], rightDeltaValues);
-                        double rightVar = computeLossVar(backwardCumulative[j], rightDeltaValues);
-                        int rightObs = backwardCumulative[j].getCount();
-                        
-                        double splitMean = combineMean(leftMean, leftObs, rightMean, rightObs);
-                        double splitVar = combineVariance(leftMean, leftVar, leftObs, rightMean, rightVar, rightObs);
+                        Split res = computeNumericSplit(i, j, forwardCumulative[j], backwardCumulative[j]);
 
-                        if (splitMean < candidate.deltaLoss) {
-                            candidate.deltaLoss = splitMean;
-                            candidate.deltaLossVar = splitVar;
-                            candidate.threshold = j;
-                            candidate.deltaValues[0] = leftDeltaValues;
-                            candidate.deltaValues[1] = rightDeltaValues;
+                        if (res.deltaLoss < best.deltaLoss) {
+                            best = res;
+                        }
+
+                        if (this.splitAttributeIndex == i && this.splitThreshold == j) {
+                            baselineLoss = res.deltaLoss;
+                            baselineVar = res.deltaLossVar;
                         }
                     }
                 }
-
-                if (candidate.deltaLoss < best.deltaLoss) {
-                    best = candidate;
-                }
             }
+
+            best.baselineLoss = baselineLoss;
+            best.baselineVar = baselineVar;
 
             return best;
         }
 
         public void applySplit(Split split) {
-            if (split.attributeIndex == -1) {
+            if (disableResplitsOption.isSet()) {
                 totalStats = null;
-                
-                for (int i = 0; i < values.length; i++) {
-                    values[i] += split.deltaValues[0][i];
-                }
-
-                return;
+                attributeStats = null;
             }
 
             this.splitAttributeIndex = split.attributeIndex;
@@ -731,16 +827,13 @@ public class StochasticGradientTree extends AbstractClassifier implements MultiC
                 this.children[0] = new Node(leftValues);
                 this.children[1] = new Node(rightValues);
             }
-
-            this.totalStats = null;
-            this.attributeStats = null;
         }
 
         public int getCount() {
             return totalStats == null ? 0 : totalStats.getCount();
         }
 
-        public double[] getValues() {
+        public double[] getPredictions(Instance inst) {
             return values.clone();
         }
     }
